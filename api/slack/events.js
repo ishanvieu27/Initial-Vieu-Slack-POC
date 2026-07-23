@@ -34,7 +34,11 @@ const app = new App({
 
 registerHandlers(app);
 
-export default receiver.requestListener;
+const originalListener = receiver.requestListener;
+export default function handler(req, res) {
+  console.log(`[vieu] ${req.method} ${req.url} | sig=${!!req.headers['x-slack-signature']} ts=${!!req.headers['x-slack-request-timestamp']} ct=${req.headers['content-type']}`);
+  return originalListener(req, res);
+}
 
 export const config = {
   api: {
