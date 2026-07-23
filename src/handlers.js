@@ -46,6 +46,24 @@ import {
 } from './intros.js';
 import { logMessage, logChannel, logScheduled, since as activitySince } from './activity.js';
 import { markSeen } from './dedupe.js';
+import { waitUntil } from '@vercel/functions';
+
+// On Vercel, once we send the HTTP ack back to Slack the function can be
+// frozen at any moment — killing background work mid-flight. waitUntil()
+// tells the platform "keep this instance alive until this promise resolves,"
+// so we can ack Slack in <100ms (staying inside its 3s slash-command budget)
+// while the actual heavy lifting continues off the critical path.
+// Off Vercel (local Socket Mode) this is a no-op that just runs work()
+// inline — safe because the local process stays alive anyway.
+function deferWork(work) {
+  const promise = Promise.resolve()
+    .then(() => work())
+    .catch((err) => {
+      console.error('[deferWork] background work failed:', err?.stack || err);
+    });
+  waitUntil(promise);
+  return promise;
+}
 
 // AE_SLACK_ID is now an optional fallback for local single-user testing.
 // In multi-tester mode, each caller of /vieu-fire is their own AE — the DMs
@@ -116,50 +134,52 @@ async function updateCard(client, connection, state) {
 // No arg → top 3 across all accounts. With arg → top 3 into that Account.
 app.command('/vieu-fire', async ({ command, ack, client, respond }) => {
   await ack();
-  const account = (command.text || '').trim();
-  const caller = command.user_id;
-  const all = await connectionsByAccount(account);
-  if (all.length === 0) {
-    await respond({
-      text: account
-        ? `No connections found for account \`${account}\`.`
-        : `No connections loaded — is data/connections.csv populated?`,
-      response_type: 'ephemeral',
-    });
-    return;
-  }
-  const top = all.slice(0, 3);
+  deferWork(async () => {
+    const account = (command.text || '').trim();
+    const caller = command.user_id;
+    const all = await connectionsByAccount(account);
+    if (all.length === 0) {
+      await respond({
+        text: account
+          ? `No connections found for account \`${account}\`.`
+          : `No connections loaded — is data/connections.csv populated?`,
+        response_type: 'ephemeral',
+      });
+      return;
+    }
+    const top = all.slice(0, 3);
 
-  await client.chat.postMessage({
-    channel: caller,
-    text: `${all.length} new connections${account ? ` into ${account}` : ''}`,
-    blocks: alertHeader({ count: all.length, account }),
-  });
-
-  for (const [idx, conn] of top.entries()) {
-    const rank = idx + 1;
-    // Seed Slack state from CSV Status the first time we ever alert on this row.
-    const fresh = await isFresh(conn.connection_id);
-    const seededStatus = fresh ? conn.seeded_state : (await getConnectionState(conn.connection_id)).status;
-
-    const res = await client.chat.postMessage({
-      channel: caller,
-      text: `${conn.target_name} via ${conn.introducer_name}`,
-      blocks: connectionCard(conn, { status: seededStatus }, rank),
-    });
-    await setConnectionState(conn.connection_id, {
-      status: seededStatus,
-      slack: { channel: res.channel, message_ts: res.ts },
-    });
-  }
-
-  if (all.length > 3) {
     await client.chat.postMessage({
       channel: caller,
-      text: `See all ${all.length} in Vieu`,
-      blocks: alertFooter({ total: all.length, account }),
+      text: `${all.length} new connections${account ? ` into ${account}` : ''}`,
+      blocks: alertHeader({ count: all.length, account }),
     });
-  }
+
+    for (const [idx, conn] of top.entries()) {
+      const rank = idx + 1;
+      // Seed Slack state from CSV Status the first time we ever alert on this row.
+      const fresh = await isFresh(conn.connection_id);
+      const seededStatus = fresh ? conn.seeded_state : (await getConnectionState(conn.connection_id)).status;
+
+      const res = await client.chat.postMessage({
+        channel: caller,
+        text: `${conn.target_name} via ${conn.introducer_name}`,
+        blocks: connectionCard(conn, { status: seededStatus }, rank),
+      });
+      await setConnectionState(conn.connection_id, {
+        status: seededStatus,
+        slack: { channel: res.channel, message_ts: res.ts },
+      });
+    }
+
+    if (all.length > 3) {
+      await client.chat.postMessage({
+        channel: caller,
+        text: `See all ${all.length} in Vieu`,
+        blocks: alertFooter({ total: all.length, account }),
+      });
+    }
+  });
 });
 
 // Capture the card's channel + ts from a button click so updateCard can target it.
@@ -752,82 +772,86 @@ app.event('message', async ({ event, client }) => {
     .trim();
   if (!raw) return;
 
-  await client.chat.postMessage({
-    channel: event.channel,
-    text: `🔍 Searching Vieu for: _${raw}_ …`,
-  });
-
-  const { connections } = await searchConnections({ query: raw });
-
-  if (connections.length === 0) {
+  deferWork(async () => {
     await client.chat.postMessage({
       channel: event.channel,
-      text: `No connections found for _${raw}_.`,
+      text: `🔍 Searching Vieu for: _${raw}_ …`,
     });
-    return;
-  }
 
-  await client.chat.postMessage({
-    channel: event.channel,
-    text: `Found ${connections.length} connection${connections.length === 1 ? '' : 's'}:`,
-  });
-  for (const conn of connections) {
+    const { connections } = await searchConnections({ query: raw });
+
+    if (connections.length === 0) {
+      await client.chat.postMessage({
+        channel: event.channel,
+        text: `No connections found for _${raw}_.`,
+      });
+      return;
+    }
+
     await client.chat.postMessage({
       channel: event.channel,
-      text: `${conn.target_name} via ${conn.connector_name}`,
-      blocks: alertResultCard(conn),
+      text: `Found ${connections.length} connection${connections.length === 1 ? '' : 's'}:`,
     });
-  }
+    for (const conn of connections) {
+      await client.chat.postMessage({
+        channel: event.channel,
+        text: `${conn.target_name} via ${conn.connector_name}`,
+        blocks: alertResultCard(conn),
+      });
+    }
+  });
 });
 
 // /vieu-reply <connection_id> yes|no — simulate the introducer's response
 app.command('/vieu-reply', async ({ command, ack, client, respond }) => {
   await ack();
-  const [id, verdict] = (command.text || '').trim().split(/\s+/);
-  if (!id || !['yes', 'no'].includes(verdict)) {
-    await respond({
-      text: 'Usage: `/vieu-reply <connection_id> yes|no`',
-      response_type: 'ephemeral',
-    });
-    return;
-  }
-  const connection = await getConnection(id);
-  if (!connection) {
-    await respond({
-      text: `No connection found with id \`${id}\`.`,
-      response_type: 'ephemeral',
-    });
-    return;
-  }
-  const state = await getConnectionState(id);
-  if (!state.slack?.channel || !state.slack?.message_ts) {
-    await respond({
-      text: `That connection has no Slack message yet — fire the alert first with \`/vieu-fire\`.`,
-      response_type: 'ephemeral',
-    });
-    return;
-  }
+  deferWork(async () => {
+    const [id, verdict] = (command.text || '').trim().split(/\s+/);
+    if (!id || !['yes', 'no'].includes(verdict)) {
+      await respond({
+        text: 'Usage: `/vieu-reply <connection_id> yes|no`',
+        response_type: 'ephemeral',
+      });
+      return;
+    }
+    const connection = await getConnection(id);
+    if (!connection) {
+      await respond({
+        text: `No connection found with id \`${id}\`.`,
+        response_type: 'ephemeral',
+      });
+      return;
+    }
+    const state = await getConnectionState(id);
+    if (!state.slack?.channel || !state.slack?.message_ts) {
+      await respond({
+        text: `That connection has no Slack message yet — fire the alert first with \`/vieu-fire\`.`,
+        response_type: 'ephemeral',
+      });
+      return;
+    }
 
-  if (verdict === 'yes') {
-    await client.chat.postMessage({
-      channel: state.slack.channel,
-      thread_ts: state.slack.message_ts,
-      text: `🎉 ${(connection.introducer_name || connection.connector_name || 'they').split(' ')[0]}'s in — they're making the intro to ${connection.target_name}. Hang tight.`,
-    });
-    const newState = await setConnectionState(id, { status: 'completed' });
-    await updateCard(client, connection, newState);
-    await client.chat.postMessage({
-      channel: state.slack.channel,
-      thread_ts: state.slack.message_ts,
-      text: `🙌 You're connected — ${connection.target_name} replied. Nice one.`,
-    });
-  } else {
-    await client.chat.postMessage({
-      channel: state.slack.channel,
-      thread_ts: state.slack.message_ts,
-      text: `Heads up — ${(connection.introducer_name || connection.connector_name || 'they').split(' ')[0]} hasn't been able to make this intro. Want to try a different path into ${connection.account || connection.target_company}? I can surface the next best connector.`,
-    });
-  }
+    if (verdict === 'yes') {
+      await client.chat.postMessage({
+        channel: state.slack.channel,
+        thread_ts: state.slack.message_ts,
+        text: `🎉 ${(connection.introducer_name || connection.connector_name || 'they').split(' ')[0]}'s in — they're making the intro to ${connection.target_name}. Hang tight.`,
+      });
+      const newState = await setConnectionState(id, { status: 'completed' });
+      await updateCard(client, connection, newState);
+      await client.chat.postMessage({
+        channel: state.slack.channel,
+        thread_ts: state.slack.message_ts,
+        text: `🙌 You're connected — ${connection.target_name} replied. Nice one.`,
+      });
+    } else {
+      await client.chat.postMessage({
+        channel: state.slack.channel,
+        thread_ts: state.slack.message_ts,
+        text: `Heads up — ${(connection.introducer_name || connection.connector_name || 'they').split(' ')[0]} hasn't been able to make this intro. Want to try a different path into ${connection.account || connection.target_company}? I can surface the next best connector.`,
+      });
+    }
+  });
 });
 
 // /vieu-reset [minutes] — demo cleanup. Deletes every message the bot posted
@@ -843,6 +867,7 @@ app.command('/vieu-reply', async ({ command, ack, client, respond }) => {
 //     sidebar; nothing further happens on Slack's side without an admin.
 app.command('/vieu-reset', async ({ command, ack, client, respond }) => {
   await ack();
+  deferWork(async () => {
   const minutes = Math.max(1, Number((command.text || '').trim()) || 60);
 
   const { messages, channels, scheduled } = await activitySince(minutes);
@@ -908,6 +933,7 @@ app.command('/vieu-reset', async ({ command, ack, client, respond }) => {
     );
   }
   await respond({ response_type: 'ephemeral', text: lines.join('\n') });
+  });
 });
 
 // @vieu <query> — CSV search flow, results render with hyperlinked names and
@@ -929,6 +955,7 @@ app.event('app_mention', async ({ event, client, context }) => {
     .replace(/^\s*alert\b/i, '')       // optional leading "alert" keyword
     .trim();
 
+  deferWork(async () => {
   // Thread reply on a known connection anchor → explain, don't search.
   const isThreadReply = event.thread_ts && event.thread_ts !== event.ts;
   if (isThreadReply) {
@@ -986,6 +1013,7 @@ app.event('app_mention', async ({ event, client, context }) => {
       blocks: alertResultCard(conn),
     });
   }
+  });
 });
 
 // URL buttons in alert results — Slack opens the URL; app just acks.

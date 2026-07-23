@@ -1,5 +1,9 @@
 node_modules/
 .env
+.env.*
+!.env.example
 data/state.json
 data/activity.json
 .DS_Store
+.vercel
+.env*

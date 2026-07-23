@@ -2,24 +2,29 @@
 // and Slash Commands: Bolt dispatches by payload shape, not by path, so all
 // three Slack app config screens point at this same Request URL.
 //
-// processBeforeResponse: true is required on serverless — without it, Bolt
-// sends the HTTP ack the moment a listener calls ack()/respond(), then keeps
-// running the rest of the listener in the background. On a real server that
-// background work finishes fine because the process stays alive; on Vercel
-// the function can be frozen the instant the response goes out, silently
-// killing anything still in flight (DM sends, state writes, etc.). This flag
-// makes Bolt hold the HTTP response until the whole listener has finished,
-// so nothing gets cut off mid-flight.
+// We use HTTPReceiver (not ExpressReceiver) here because Vercel's Node.js
+// serverless runtime buffers and parses the request body before handing it to
+// user code. Slack's signature verification depends on hashing the exact raw
+// bytes of the payload — a parsed/re-serialized body will not hash the same,
+// producing spurious 401 "Signature mismatch" rejections. HTTPReceiver reads
+// the raw request stream itself via its `requestListener`, sidestepping any
+// intermediate body parser and matching what Slack actually signed.
+//
+// processBeforeResponse is FALSE here (Bolt's default): ack() fires the HTTP
+// response back to Slack immediately, which is what Slack's 3-second budget
+// for slash commands actually requires. Individual slow handlers wrap their
+// post-ack work in deferWork() (see handlers.js) so Vercel keeps the function
+// alive via waitUntil until the background work finishes — rather than
+// forcing every handler to complete before the ack goes out.
 import 'dotenv/config';
 import bolt from '@slack/bolt';
 import { registerHandlers } from '../../src/handlers.js';
 
-const { App, ExpressReceiver } = bolt;
+const { App, HTTPReceiver } = bolt;
 
-const receiver = new ExpressReceiver({
+const receiver = new HTTPReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
   endpoints: '/api/slack/events',
-  processBeforeResponse: true,
 });
 
 const app = new App({
@@ -29,4 +34,10 @@ const app = new App({
 
 registerHandlers(app);
 
-export default receiver.app;
+export default receiver.requestListener;
+
+export const config = {
+  api: {
+    bodyParser: false,
+  },
+};
