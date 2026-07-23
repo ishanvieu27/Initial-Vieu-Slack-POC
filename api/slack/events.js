@@ -18,6 +18,7 @@
 // forcing every handler to complete before the ack goes out.
 import 'dotenv/config';
 import bolt from '@slack/bolt';
+import { waitUntil } from '@vercel/functions';
 import { registerHandlers } from '../../src/handlers.js';
 
 const { App, HTTPReceiver } = bolt;
@@ -37,6 +38,10 @@ registerHandlers(app);
 const originalListener = receiver.requestListener;
 export default function handler(req, res) {
   console.log(`[vieu] ${req.method} ${req.url} | sig=${!!req.headers['x-slack-signature']} ts=${!!req.headers['x-slack-request-timestamp']} ct=${req.headers['content-type']}`);
+  // Keep function alive for 30s so deferWork background tasks complete.
+  // HTTPReceiver's fire-and-forget async IIFE means waitUntil inside
+  // deferWork runs too late — Vercel freezes before it registers.
+  waitUntil(new Promise(resolve => setTimeout(resolve, 30000)));
   return originalListener(req, res);
 }
 
