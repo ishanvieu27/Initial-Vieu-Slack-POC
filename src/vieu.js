@@ -1,8 +1,24 @@
 import OpenAI from 'openai';
+import { kv } from './kv.js';
 import { loadConnections } from './store.js';
 
 const openai = new OpenAI();
-const threadHistory = new Map();
+
+// Per-thread conversation memory. Was an in-memory Map — fine on Socket
+// Mode's single long-lived process, but a fresh serverless invocation can
+// start with an empty Map, silently forgetting the conversation mid-thread.
+// KV with a TTL keeps it correct either way; threads older than the TTL
+// naturally expire instead of accumulating forever.
+const THREAD_TTL_SECONDS = 6 * 60 * 60; // 6 hours — generous for one demo session
+
+async function getThreadMessages(key) {
+  const messages = await kv.get(`vieu:thread:${key}`);
+  return messages || [];
+}
+
+async function saveThreadMessages(key, messages) {
+  await kv.set(`vieu:thread:${key}`, messages, { ex: THREAD_TTL_SECONDS });
+}
 
 // ── Search: purely local CSV, no LLM URL fabrication, no external calls ──
 
@@ -115,10 +131,7 @@ function slackifyMarkdown(text) {
 
 export async function explainConnection({ connection, question, threadTs }) {
   const historyKey = threadTs || 'ephemeral';
-  if (!threadHistory.has(historyKey)) {
-    threadHistory.set(historyKey, []);
-  }
-  const messages = threadHistory.get(historyKey);
+  const messages = await getThreadMessages(historyKey);
   messages.push({ role: 'user', content: question });
 
   const systemMsg = `${EXPLAIN_SYSTEM_PROMPT}\n\nCONNECTION DATA (all fields):\n\`\`\`json\n${connectionAsJson(connection)}\n\`\`\``;
@@ -133,10 +146,11 @@ export async function explainConnection({ connection, question, threadTs }) {
     const reply = slackifyMarkdown(raw);
     messages.push({ role: 'assistant', content: reply });
     if (messages.length > 20) messages.splice(0, messages.length - 20);
+    await saveThreadMessages(historyKey, messages);
     return reply;
   } catch (err) {
     console.error('[LLM] explain failed:', err.message);
-    messages.pop();
+    // Not persisted — the failed turn never got saved, so history stays clean.
     return `Sorry, I hit an error. Here's what I know:\n\n*${connection.introducer_name || ''}* → *${connection.target_name}* (${connection.account || ''})\n${connection.summary || ''}\n\nVieu Score: *${connection.vieu_score ?? 'n/a'}*`;
   }
 }

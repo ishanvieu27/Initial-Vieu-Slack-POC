@@ -1,28 +1,25 @@
 // Append-only log of every message/channel/scheduled-reminder the bot has
 // created on Slack. Backs `/vieu-reset` — the only way to know exactly what
 // to delete/archive/cancel without scanning every channel via conversations.history.
+//
+// Lives in Vercel KV rather than a local file — same reason as store.js:
+// Vercel's filesystem isn't writable/shared across invocations.
 
-import { readFile, writeFile } from 'node:fs/promises';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { kv } from './kv.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ACTIVITY_PATH = path.join(__dirname, '..', 'data', 'activity.json');
+const ACTIVITY_KEY = 'vieu:activity';
 
 // Demos happen within minutes/hours, not days — auto-prune anything older so
 // the log doesn't grow unbounded across many POC sessions.
 const MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 async function read() {
-  try {
-    return JSON.parse(await readFile(ACTIVITY_PATH, 'utf8'));
-  } catch {
-    return { messages: [], channels: [], scheduled: [] };
-  }
+  const log = await kv.get(ACTIVITY_KEY);
+  return log || { messages: [], channels: [], scheduled: [] };
 }
 
 async function write(log) {
-  await writeFile(ACTIVITY_PATH, JSON.stringify(log, null, 2));
+  await kv.set(ACTIVITY_KEY, log);
 }
 
 function prune(list, now) {

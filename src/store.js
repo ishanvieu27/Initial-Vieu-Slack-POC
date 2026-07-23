@@ -1,12 +1,18 @@
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { parse } from 'csv-parse/sync';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { kv } from './kv.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const CSV_PATH = path.join(DATA_DIR, 'connections.csv');
-const STATE_PATH = path.join(DATA_DIR, 'state.json');
+
+// State lives in Vercel KV, not a local file — Vercel's filesystem is
+// read-only at runtime and isn't shared across invocations. connections.csv
+// stays file-based: it's static seed data bundled with the deployment
+// (declared in vercel.json's includeFiles), never written to at runtime.
+const STATE_KEY = 'vieu:state';
 
 let connectionsCache = null;
 
@@ -167,15 +173,12 @@ export async function getConnection(id) {
 }
 
 async function readState() {
-  try {
-    return JSON.parse(await readFile(STATE_PATH, 'utf8'));
-  } catch {
-    return { connections: {} };
-  }
+  const state = await kv.get(STATE_KEY);
+  return state || { connections: {} };
 }
 
 async function writeState(state) {
-  await writeFile(STATE_PATH, JSON.stringify(state, null, 2));
+  await kv.set(STATE_KEY, state);
 }
 
 export async function getConnectionState(id) {

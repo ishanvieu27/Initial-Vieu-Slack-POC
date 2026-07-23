@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/slack/events.js": {
+      "includeFiles": "data/connections.csv"
+    }
+  }
+}
